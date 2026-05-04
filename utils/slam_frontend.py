@@ -126,7 +126,17 @@ class FrontEnd(mp.Process):
         self.reset = False
 
     def tracking(self, cur_frame_idx, viewpoint):
-        prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
+        prev_idx = cur_frame_idx - self.use_every_n_frames
+        if prev_idx not in self.cameras:
+            # Previous frame not in cameras (sparse frame IDs or gap after reset).
+            # Fall back to the most recently added frame.
+            if self.cameras:
+                prev_idx = max(self.cameras.keys())
+            else:
+                # No frames at all — treat as initialization
+                self.initialized = False
+                return
+        prev = self.cameras[prev_idx]
         viewpoint.update_RT(prev.R, prev.T)
 
         opt_params = []
@@ -160,10 +170,17 @@ class FrontEnd(mp.Process):
         )
 
         pose_optimizer = torch.optim.Adam(opt_params)
+        render_pkg = None
+        depth = None
+        opacity = None
         for tracking_itr in range(self.tracking_itr_num):
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background
             )
+            if render_pkg is None:
+                # Gaussians not yet initialized - skip optimization, keep
+                # the pose propagated from the previous frame.
+                break
             image, depth, opacity = (
                 render_pkg["render"],
                 render_pkg["depth"],
@@ -192,7 +209,8 @@ class FrontEnd(mp.Process):
             if converged:
                 break
 
-        self.median_depth = get_median_depth(depth, opacity)
+        if depth is not None and opacity is not None:
+            self.median_depth = get_median_depth(depth, opacity)
         return render_pkg
 
     def is_keyframe(

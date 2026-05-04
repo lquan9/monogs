@@ -32,7 +32,15 @@ import torch
 import torch.multiprocessing as mp
 from munch import munchify
 
-from gaussian_splatting.gaussian_renderer import render
+_render = None
+
+def _get_render():
+    global _render
+    if _render is None:
+        from gaussian_splatting.gaussian_renderer import render as _r
+        _render = _r
+    return _render
+
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, focal2fov
 from gaussian_splatting.utils.system_utils import mkdir_p
@@ -253,10 +261,20 @@ class GaussianSplattingManager:
             return
         self._backend_queue.put(["stop"])
         if self._backend_process is not None:
-            self._backend_process.join(timeout=30)
+            self._backend_process.join(timeout=10)
+            if self._backend_process.is_alive():
+                self._backend_process.terminate()
+                self._backend_process.join(timeout=5)
+            if self._backend_process.is_alive():
+                self._backend_process.kill()
         if self._gui_process is not None:
             self._q_main2vis.put({"finish": True})
-            self._gui_process.join(timeout=10)
+            self._gui_process.join(timeout=5)
+            if self._gui_process.is_alive():
+                self._gui_process.terminate()
+                self._gui_process.join(timeout=3)
+            if self._gui_process.is_alive():
+                self._gui_process.kill()
         self._started = False
         self._print("GaussianSplattingManager: stopped")
 
@@ -269,6 +287,38 @@ class GaussianSplattingManager:
             self._frontend.cameras.clear()
             self._frame_idx = 0
         self._print("GaussianSplattingManager: reset")
+
+    def _drain_frontend_queue(self, block=False, timeout=5.0):
+        """Drain pending backend->frontend messages and call sync_backend.
+
+        When block=True, waits up to *timeout* seconds for at least one message
+        (used after sending 'init' to wait for the backend to respond with
+        initial Gaussians).
+        """
+        if block:
+            try:
+                data = self._frontend_queue.get(timeout=timeout)
+                self._frontend.sync_backend(data)
+                if data[0] == "init":
+                    self._frontend.requested_init = False
+                elif data[0] == "keyframe":
+                    self._frontend.requested_keyframe = max(
+                        0, self._frontend.requested_keyframe - 1
+                    )
+            except Exception:
+                pass
+        while not self._frontend_queue.empty():
+            try:
+                data = self._frontend_queue.get_nowait()
+                self._frontend.sync_backend(data)
+                if data[0] == "init":
+                    self._frontend.requested_init = False
+                elif data[0] == "keyframe":
+                    self._frontend.requested_keyframe = max(
+                        0, self._frontend.requested_keyframe - 1
+                    )
+            except Exception:
+                break
 
     # ------------------------------------------------------------------
     # Core frame-by-frame API
@@ -352,13 +402,21 @@ class GaussianSplattingManager:
             pose_t = _pose_to_tensor(pose_np, device=self.device)
             viewpoint.update_RT(pose_t[:3, :3], pose_t[:3, 3])
 
-            self._frontend.cameras[frame_id] = viewpoint
-            cur_frame_idx = frame_id
+            # Use a sequential index for tracking (slam_frontend.tracking looks
+            # up cameras[cur_frame_idx - use_every_n_frames], so the index must
+            # be contiguous regardless of the sparse frame_id passed in).
+            cur_frame_idx = self._frame_idx
+            viewpoint.uid = cur_frame_idx
+            self._frontend.cameras[cur_frame_idx] = viewpoint
 
             if self._frontend.reset or not self._frontend.initialized:
                 self._frontend.initialize(cur_frame_idx, viewpoint)
                 self._frontend.current_window.append(cur_frame_idx)
+                # Block-wait for backend to respond with initial Gaussians
+                self._drain_frontend_queue(block=True, timeout=5.0)
             else:
+                # Drain any pending backend updates before tracking/rendering
+                self._drain_frontend_queue(block=False)
                 # Tracking: refine pose using the current gaussian map
                 self._frontend.tracking(cur_frame_idx, viewpoint)
 
@@ -366,10 +424,14 @@ class GaussianSplattingManager:
                 last_kf_idx = self._frontend.current_window[0] if self._frontend.current_window else cur_frame_idx
                 render_pkg = self._render(
                     viewpoint,
-                    self._gaussians,
+                    self._frontend.gaussians,
                     self._pipeline_params,
                     self._bg_color,
                 )
+                if render_pkg is None:
+                    # Gaussians not yet initialized; skip keyframe decision
+                    self._frame_idx += 1
+                    return
                 curr_visibility = (render_pkg["n_touched"] > 0).long()
                 create_kf = self._frontend.is_keyframe(
                     cur_frame_idx,
@@ -400,7 +462,7 @@ class GaussianSplattingManager:
             render, viewspace_points, visibility_filter, radii, depth, n_touched
         """
         if not self.use_fast_renderer:
-            return render(viewpoint, gaussians, pipeline_params, bg_color)
+            return _get_render()(viewpoint, gaussians, pipeline_params, bg_color)
 
         # --- fastgs path ------------------------------------------------
         # render_fastgs signature:
@@ -460,9 +522,14 @@ class GaussianSplattingManager:
         colors : np.ndarray | None  shape (N, 3)
         """
         try:
-            gaussians = self._gaussians
+            # Use the frontend's gaussians — kept up-to-date via sync_backend()
+            gaussians = self._frontend.gaussians
+            if gaussians is None:
+                return None, None
             xyz = gaussians.get_xyz.detach().cpu().numpy()           # (N, 3)
             features = gaussians.get_features.detach().cpu().numpy() # (N, K, 3)
+            if xyz.ndim != 2 or xyz.shape[1] != 3 or features.ndim != 3:
+                return None, None
             # Use the DC (zeroth-order) SH feature as colour
             colors = features[:, 0, :]   # (N, 3)
             colors = (colors * 0.28209479177387814 + 0.5).clip(0, 1)
