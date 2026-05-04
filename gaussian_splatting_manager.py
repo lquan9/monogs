@@ -32,15 +32,7 @@ import torch
 import torch.multiprocessing as mp
 from munch import munchify
 
-_render = None
-
-def _get_render():
-    global _render
-    if _render is None:
-        from gaussian_splatting.gaussian_renderer import render as _r
-        _render = _r
-    return _render
-
+from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, focal2fov
 from gaussian_splatting.utils.system_utils import mkdir_p
@@ -50,20 +42,6 @@ from utils.multiprocessing_utils import FakeQueue, clone_obj
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
 from utils.eval_utils import save_gaussians
-
-try:
-    import sys as _sys
-    import os as _os
-    _fastgs_dir = _os.path.join(_os.path.dirname(__file__), "..", "fastgs")
-    if _fastgs_dir not in _sys.path:
-        _sys.path.insert(0, _os.path.abspath(_fastgs_dir))
-    from gaussian_renderer import render_fastgs as _render_fastgs
-    from diff_gaussian_rasterization import SparseGaussianAdam as _SparseGaussianAdam
-    _FASTGS_AVAILABLE = True
-except ImportError:
-    _render_fastgs = None
-    _SparseGaussianAdam = None
-    _FASTGS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -134,8 +112,6 @@ class GaussianSplattingManager:
         use_dataset: bool = False,
         print_fun=None,
         device: str = "cuda:0",
-        use_fast_renderer: bool = False,
-        use_sparse_adam: bool = False,
     ):
         self.config = config
         self.save_results = save_results
@@ -145,21 +121,6 @@ class GaussianSplattingManager:
         self.eval_rendering = eval_rendering
         self.device = device
         self._print = print_fun or logger.info
-
-        if use_fast_renderer and not _FASTGS_AVAILABLE:
-            logger.warning(
-                "use_fast_renderer=True but fastgs is not importable; "
-                "falling back to the standard monogs renderer."
-            )
-            use_fast_renderer = False
-        if use_sparse_adam and not _FASTGS_AVAILABLE:
-            logger.warning(
-                "use_sparse_adam=True but fastgs/SparseGaussianAdam is not "
-                "importable; falling back to torch.optim.Adam."
-            )
-            use_sparse_adam = False
-        self.use_fast_renderer = use_fast_renderer
-        self.use_sparse_adam = use_sparse_adam
 
         # Patch config for live use
         self.config["Results"]["save_results"] = save_results
@@ -179,17 +140,6 @@ class GaussianSplattingManager:
         self._gaussians = GaussianModel(self._model_params.sh_degree, config=config)
         self._gaussians.init_lr(6.0)
         self._gaussians.training_setup(self._opt_params)
-
-        if use_sparse_adam:
-            # Replace the standard Adam with the faster sparse variant from fastgs.
-            param_groups = [
-                {k: v for k, v in pg.items() if k != "params"} | {"params": pg["params"]}
-                for pg in self._gaussians.optimizer.param_groups
-            ]
-            self._gaussians.optimizer = _SparseGaussianAdam(
-                param_groups, lr=0.0, eps=1e-15
-            )
-            self._print("GaussianSplattingManager: using SparseGaussianAdam optimizer")
 
         self._frontend_queue = mp.Queue()
         self._backend_queue = mp.Queue()
@@ -261,20 +211,10 @@ class GaussianSplattingManager:
             return
         self._backend_queue.put(["stop"])
         if self._backend_process is not None:
-            self._backend_process.join(timeout=10)
-            if self._backend_process.is_alive():
-                self._backend_process.terminate()
-                self._backend_process.join(timeout=5)
-            if self._backend_process.is_alive():
-                self._backend_process.kill()
+            self._backend_process.join(timeout=30)
         if self._gui_process is not None:
             self._q_main2vis.put({"finish": True})
-            self._gui_process.join(timeout=5)
-            if self._gui_process.is_alive():
-                self._gui_process.terminate()
-                self._gui_process.join(timeout=3)
-            if self._gui_process.is_alive():
-                self._gui_process.kill()
+            self._gui_process.join(timeout=10)
         self._started = False
         self._print("GaussianSplattingManager: stopped")
 
@@ -288,13 +228,13 @@ class GaussianSplattingManager:
             self._frame_idx = 0
         self._print("GaussianSplattingManager: reset")
 
-    def _drain_frontend_queue(self, block=False, timeout=5.0):
-        """Drain pending backend->frontend messages and call sync_backend.
+    def _drain_frontend_queue(self, block=False, timeout=0.5):
+        """Drain pending messages from the backend->frontend queue.
 
         When block=True, waits up to *timeout* seconds for at least one message
-        (used after sending 'init' to wait for the backend to respond with
-        initial Gaussians).
+        (used after sending 'init' to wait for the backend to respond).
         """
+        drained = 0
         if block:
             try:
                 data = self._frontend_queue.get(timeout=timeout)
@@ -305,6 +245,7 @@ class GaussianSplattingManager:
                     self._frontend.requested_keyframe = max(
                         0, self._frontend.requested_keyframe - 1
                     )
+                drained += 1
             except Exception:
                 pass
         while not self._frontend_queue.empty():
@@ -317,8 +258,10 @@ class GaussianSplattingManager:
                     self._frontend.requested_keyframe = max(
                         0, self._frontend.requested_keyframe - 1
                     )
+                drained += 1
             except Exception:
                 break
+        return drained
 
     # ------------------------------------------------------------------
     # Core frame-by-frame API
@@ -402,17 +345,13 @@ class GaussianSplattingManager:
             pose_t = _pose_to_tensor(pose_np, device=self.device)
             viewpoint.update_RT(pose_t[:3, :3], pose_t[:3, 3])
 
-            # Use a sequential index for tracking (slam_frontend.tracking looks
-            # up cameras[cur_frame_idx - use_every_n_frames], so the index must
-            # be contiguous regardless of the sparse frame_id passed in).
-            cur_frame_idx = self._frame_idx
-            viewpoint.uid = cur_frame_idx
-            self._frontend.cameras[cur_frame_idx] = viewpoint
+            self._frontend.cameras[frame_id] = viewpoint
+            cur_frame_idx = frame_id
 
             if self._frontend.reset or not self._frontend.initialized:
                 self._frontend.initialize(cur_frame_idx, viewpoint)
                 self._frontend.current_window.append(cur_frame_idx)
-                # Block-wait for backend to respond with initial Gaussians
+                # Block-wait for the backend to respond with initial Gaussians
                 self._drain_frontend_queue(block=True, timeout=5.0)
             else:
                 # Drain any pending backend updates before tracking/rendering
@@ -422,7 +361,7 @@ class GaussianSplattingManager:
 
                 # Keyframe decision
                 last_kf_idx = self._frontend.current_window[0] if self._frontend.current_window else cur_frame_idx
-                render_pkg = self._render(
+                render_pkg = render(
                     viewpoint,
                     self._frontend.gaussians,
                     self._pipeline_params,
@@ -450,66 +389,6 @@ class GaussianSplattingManager:
             self._frame_idx += 1
 
     # ------------------------------------------------------------------
-    # Renderer dispatch
-    # ------------------------------------------------------------------
-
-    def _render(self, viewpoint, gaussians, pipeline_params, bg_color):
-        """Dispatch to either the standard monogs renderer or fastgs.
-
-        The returned dict always contains at least the keys used by the rest
-        of the manager::
-
-            render, viewspace_points, visibility_filter, radii, depth, n_touched
-        """
-        if not self.use_fast_renderer:
-            return _get_render()(viewpoint, gaussians, pipeline_params, bg_color)
-
-        # --- fastgs path ------------------------------------------------
-        # render_fastgs signature:
-        #   render_fastgs(viewpoint, pc, pipe, bg, mult, scaling_modifier,
-        #                 override_color, get_flag, metric_map)
-        # Returns: render, viewspace_points, visibility_filter (nonzero indices),
-        #          radii, accum_metric_counts
-        # Missing vs monogs: depth, opacity, n_touched
-        # ----------------------------------------------------------------
-        pkg = _render_fastgs(
-            viewpoint, gaussians, pipeline_params, bg_color,
-            mult=1.0,  # neutral multiplier
-        )
-
-        radii = pkg["radii"]
-
-        # Build a per-Gaussian n_touched proxy: 1 where the Gaussian is visible.
-        # Monogs uses n_touched > 0 only for the keyframe decision, so a binary
-        # mask is sufficient.
-        n_touched = (radii > 0).long()
-
-        # fastgs visibility_filter is nonzero() indices; normalise to bool mask.
-        vis_filter = pkg["visibility_filter"]
-        if vis_filter.ndim > 1:
-            # nonzero() returns (N,1) — convert to flat bool
-            bool_mask = torch.zeros(radii.shape[0], dtype=torch.bool, device=radii.device)
-            bool_mask[vis_filter.squeeze(1)] = True
-            vis_filter = bool_mask
-
-        # depth is not produced by fastgs; supply a zero tensor as a placeholder
-        # so callers that check for its presence don't crash.
-        depth_placeholder = torch.zeros(
-            1, int(viewpoint.image_height), int(viewpoint.image_width),
-            device=bg_color.device,
-        )
-
-        return {
-            "render": pkg["render"],
-            "viewspace_points": pkg["viewspace_points"],
-            "visibility_filter": vis_filter,
-            "radii": radii,
-            "depth": depth_placeholder,
-            "opacity": None,
-            "n_touched": n_touched,
-        }
-
-    # ------------------------------------------------------------------
     # Output / persistence
     # ------------------------------------------------------------------
 
@@ -522,7 +401,8 @@ class GaussianSplattingManager:
         colors : np.ndarray | None  shape (N, 3)
         """
         try:
-            # Use the frontend's gaussians — kept up-to-date via sync_backend()
+            # Use the frontend's gaussians — these are kept up-to-date via
+            # sync_backend() which is called from _drain_frontend_queue().
             gaussians = self._frontend.gaussians
             if gaussians is None:
                 return None, None
